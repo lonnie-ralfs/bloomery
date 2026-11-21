@@ -1,5 +1,7 @@
 # Bloomery — blacksmithing game (Babylon.js)
 
+**▶ Play: https://lonnie-ralfs.github.io/bloomery/**
+
 Phase 1: **smelting**. Phase 2: **forging the bloom into a billet**. First person, mouse only, one action at a time.
 
 ## Forging (forge + anvil)
