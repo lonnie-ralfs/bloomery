@@ -820,6 +820,70 @@ export class FurnaceStation {
     }
   }
 
+  // ------------------------------------------------------------------ test-tool skips (one per step)
+  skipWalls() {
+    const g = this.g, f = g.state.furnace;
+    if (this.partial && this.partial.mesh) this.partial.mesh.dispose();
+    this.partial = null;
+    while (f.courses < NC) {
+      if (f.courses >= 2 && !f.tuyere) this.skipTuyere(); // the tuyere goes in after course 2
+      const i = f.courses, m = this._courseMesh(i, i < 2 ? GAP : 0, needArc(i) + (i < 2 ? 0 : 0.25), 1, 'course');
+      m.material = this.clayMat; g.world.caster(m); this.courses.push(m); f.courses++;
+    }
+    if (g.state.daubQ === 0) g.state.daubQ = 0.85;
+    this._ghost();
+  }
+  skipTuyere() {
+    const f = this.g.state.furnace;
+    if (!f.tuyere) { this.tuyere.position.set(-0.42, TUY_Y, C.z); this.tuyere.rotation.set(0, 0, -Math.PI / 2); f.tuyere = true; }
+    this._ghost();
+  }
+  skipPlug() { const f = this.g.state.furnace; if (!f.plug) { this._makePlug(); f.plug = true; } }
+  skipDry() {
+    const f = this.g.state.furnace;
+    f.dry = 1; f.dried = true; f.drying = false; this.embers = true;
+    this.sim.wall = this._wall();
+  }
+  skipPatch() {
+    const daub = this.g.state.daub;
+    for (const c of this.cracks) if (!c.patched) { this.g.state.daub = Math.max(daub, 1); this._patch(c); }
+    this.g.state.daub = daub;
+  }
+  skipHeat() {
+    const sim = this.sim;
+    if (sim.F < 4) sim.F = 5;
+    sim.lit = true; sim.T = Math.max(sim.T, 1200); sim.reachedHeat = true; sim.wall = this._wall();
+  }
+  // Run the smelt to the end with steady, sensible play (so the bloom is a real result)
+  skipSmelt() {
+    const st = this.g.state, sim = this.sim;
+    if (st.ore < 0.5 && sim.chargedOre < 0.5) { st.ore += 5; st.oreIronKg += 4.4; st.orePanned = Math.max(st.orePanned, 5); }
+    this.skipHeat();
+    for (let t = 0; t < 900; t += 0.1) {
+      if (sim.ore < 0.5 && st.ore > 0.01 && sim.canAdd(1.45)) {
+        sim.addCharcoal(1);
+        const kg = Math.min(1, st.ore), iron = kg * (st.oreIronKg / st.ore);
+        st.ore -= kg; st.oreIronKg -= iron; sim.addOre(kg, iron);
+      }
+      if (sim.F < 1.2) sim.addCharcoal(1);
+      if (sim.slagLevel > 0.7 && !sim.tapping) sim.openTap();
+      sim.P = 0.92 / 0.8; // steady bellows, ~0.9 strokes a second
+      sim.step(0.1, 0);
+      if (st.ore <= 0.01 && sim.ore < 0.1) break;
+    }
+    st.ore = 0; st.oreIronKg = 0; sim.ore = 0; sim.P = 0;
+    this.g.containers.refresh();
+  }
+  skipTap() { if (this.sim.slagTapped <= 0.3) { this.sim.slagTapped += 0.5; this.sim.slag = Math.max(0, this.sim.slag - 0.5); this.sim.tapCount = Math.max(1, this.sim.tapCount); } }
+  skipBreak() { if (!this.reduced) this.skipSmelt(); if (!this.broken) this._breakOpen(); }
+  skipPull() {
+    if (!this.broken) this.skipBreak();
+    if (this.placed) return;
+    const r = this.bloom.metadata.radius;
+    this.bloom.position.set(STUMP.x, STUMP_H + r * 0.7, STUMP.z);
+    this.placed = true; this._finish();
+  }
+
   // ------------------------------------------------------------------ dev shortcut
   instantBuild() {
     const g = this.g, f = g.state.furnace;

@@ -10,7 +10,7 @@ import { ClayStation } from './stations/clay.js';
 import { TroughStation } from './stations/trough.js';
 import { FurnaceStation, NC } from './stations/furnace.js';
 import { ForgeStation } from './stations/forge.js';
-import { AnvilStation } from './stations/anvil.js';
+import { AnvilStation, BILLETS } from './stations/anvil.js';
 import { Workpiece } from './workpiece.js';
 
 const canvas = document.getElementById('c');
@@ -130,7 +130,7 @@ window.addEventListener('keydown', e => {
   else if (k === 'd' || k === 'arrowright') cycle(1);
   else if ('123456'.includes(k)) goTo(order[+k - 1]);
   else if (k === 'e' && !travelling) active.stand && active.stand();
-  else if (e.key === '`') { const d = document.getElementById('dev'); d.hidden = !d.hidden; }
+  else if (e.key === '`') toggleDev();
 });
 window.addEventListener('resize', () => engine.resize());
 
@@ -151,69 +151,144 @@ function updateHover() {
   }
 }
 
+// ---------------------------------------------------------------- the steps
+// One list drives the objectives on the left and the Test tools (skip / jump) panel.
+// skip() completes that one step as if you'd done it; jumping to a step skips everything before it.
+const fs = stations.furnace, an = stations.anvil;
+const STAGES = ['consolidate', 'ingot', 'billet', 'done'];
+const after = s => { const p = g.piece; return !!p && STAGES.indexOf(p.stage) > STAGES.indexOf(s); };
+const pct = v => Math.round(v * 100) + '%';
+// the forging steps need a workpiece: the smelted bloom if there is one, otherwise a fresh 2 kg bloom
+const needPiece = () => {
+  if (g.piece) return g.piece;
+  if (fs.placed) return g.ensurePiece();
+  if (fs.broken || fs.bloom) fs.skipPull();
+  return g.ensurePiece() || g.makePiece({ mass: 2, slag: 0.12, carbon: 0.5, T: 1250 });
+};
+const placeAtAnvil = p => { if (active === an) an.place(p); };
+const STEPS = [
+  { phase: 'smelt', st: 'stream', text: () => `Pan iron sand at the stream (${state.orePanned.toFixed(1)} / 4 kg)`,
+    done: () => state.orePanned >= 4 || fs.sim.chargedOre >= 4,
+    skip: () => { state.ore += 5; state.oreIronKg += 4.4; state.orePanned = Math.max(state.orePanned + 5, 5); } },
+  { phase: 'smelt', st: 'clay', text: () => `Dig clay (${Math.min(state.clayDug, 8)} / 8)`,
+    done: () => state.clayDug >= 8 || state.furnace.courses >= NC,
+    skip: () => { state.clay = Math.max(state.clay, 8); state.clayDug = Math.max(state.clayDug, 8); } },
+  { phase: 'smelt', st: 'clay', text: () => `Pull straw (${Math.min(state.strawPulled, 3)} / 3)`,
+    done: () => state.strawPulled >= 3 || state.furnace.courses >= NC,
+    skip: () => { state.straw = Math.max(state.straw, 3); state.strawPulled = Math.max(state.strawPulled, 3); } },
+  { phase: 'smelt', st: 'trough', text: () => 'Mix clay, straw & water into daub',
+    done: () => state.daubBatches > 0 || state.furnace.courses >= NC,
+    skip: () => { state.clay = Math.max(0, state.clay - 8); state.straw = Math.max(0, state.straw - 3); state.daubQ = state.daub ? state.daubQ : 0.85; state.daub += 10; state.daubBatches++; } },
+  { phase: 'smelt', st: 'furnace', text: () => `Build the furnace walls (${state.furnace.courses} / ${NC} courses)`,
+    done: () => state.furnace.courses >= NC, skip: () => fs.skipWalls() },
+  { phase: 'smelt', st: 'furnace', text: () => 'Fit the clay tuyere (air pipe)', done: () => state.furnace.tuyere, skip: () => fs.skipTuyere() },
+  { phase: 'smelt', st: 'furnace', text: () => 'Plug the front arch', done: () => state.furnace.plug, skip: () => fs.skipPlug() },
+  { phase: 'smelt', st: 'furnace', text: () => 'Dry the furnace with a gentle fire', done: () => state.furnace.dried, skip: () => fs.skipDry() },
+  { phase: 'smelt', st: 'furnace', optional: true, text: () => `Patch drying cracks${fs.openCracks ? ` (${fs.openCracks} left)` : ''}`,
+    done: () => state.furnace.dried && fs.openCracks === 0, skip: () => fs.skipPatch() },
+  { phase: 'smelt', st: 'furnace', text: () => 'Fill with charcoal & bring it to 1100 °C', done: () => fs.sim.reachedHeat, skip: () => fs.skipHeat() },
+  { phase: 'smelt', st: 'furnace', text: () => `Charge your iron sand & smelt (${fs.sim.chargedOre.toFixed(1)} kg in)`,
+    done: () => fs.breakReady || fs.broken, skip: () => fs.skipSmelt() },
+  { phase: 'smelt', st: 'furnace', optional: true, text: () => 'Tap the slag as it rises', done: () => fs.sim.slagTapped > 0.3, skip: () => fs.skipTap() },
+  { phase: 'smelt', st: 'furnace', text: () => 'Break open the front arch', done: () => fs.broken, skip: () => fs.skipBreak() },
+  { phase: 'smelt', st: 'furnace', text: () => 'Pull the bloom onto the stump', done: () => fs.placed || !!g.piece, skip: () => { fs.skipPull(); g.hud.closeModal(); } },
+  { phase: 'forge', st: 'forge', text: () => 'Bring the bloom to welding heat in the forge (1150 °C+)',
+    done: () => !!(g.piece && (g.piece.stats.weldHeat || after('consolidate'))),
+    skip: () => { const p = needPiece(); p.T = 1250; p.stats.weldHeat = true; } },
+  { phase: 'forge', st: 'anvil', text: () => `Consolidate it with gentle blows (${pct(g.piece ? g.piece.cohesion : 0)})`,
+    done: () => after('consolidate'),
+    skip: () => { const p = needPiece(); p.cohesion = 1; p.porosity = 0.05; p.densify(); p.stage = 'ingot'; p.T = 1250; p.stats.weldHeat = true; placeAtAnvil(p); } },
+  { phase: 'forge', st: 'anvil', text: () => `Square it into a rough ingot${g.piece && g.piece.stage === 'ingot' ? ` (${pct(an.fitV)} to shape)` : ''}`,
+    done: () => after('ingot'),
+    skip: () => { const p = needPiece(); p.stats.ingotFit = p.stats.ingotFit ?? 0.7; an._startBillet(an.billet || BILLETS[0]); p.T = 1250; placeAtAnvil(p); } },
+  { phase: 'forge', st: 'anvil', text: () => `Draw it out into a billet${g.piece && g.piece.stage === 'billet' ? ` (${pct(an.fitV)} to shape)` : ''}`,
+    done: () => after('billet'),
+    skip: () => { const p = needPiece(); if (!an.billet) an._startBillet(BILLETS[0]); an.tg = p.target(an.billet.ratio); an.fitV = p.fit(an.tg, true); an.finishBillet(); } },
+];
+const firstOpen = () => STEPS.find(s => !s.done() && !s.optional);
+function skipStep(step) {
+  try { step.skip(); } catch (e) { console.error(e); g.hud.toast('Could not skip: ' + e.message, 'bad'); }
+  g.containers.refresh();
+}
+function skipCurrent() {
+  const cur = firstOpen();
+  if (!cur) return g.hud.toast('Nothing left to skip');
+  skipStep(cur);
+  const next = firstOpen();
+  g.hud.toast('Skipped: ' + cur.text().replace(/\s*\(.*\)$/, ''), 'info', 2);
+  if (next && next.st !== active.id) goTo(next.st);
+}
+function jumpTo(i) {
+  for (let j = 0; j < i; j++) if (!STEPS[j].done()) skipStep(STEPS[j]);
+  g.hud.closeModal();
+  const st = STEPS[i].st;
+  if (st !== active.id) goTo(st); else { active.enter && active.enter(); active.panel && active.panel(); }
+  g.hud.toast('Jumped to: ' + STEPS[i].text().replace(/\s*\(.*\)$/, ''), 'info', 2);
+}
+
 // ---------------------------------------------------------------- objectives
-function forgingObjectives() {
-  const p = g.piece, pct = v => Math.round(v * 100) + '%', an = stations.anvil;
-  const stg = p ? p.stage : 'consolidate', after = s => ['consolidate', 'ingot', 'billet', 'done'].indexOf(stg) > ['consolidate', 'ingot', 'billet', 'done'].indexOf(s);
-  const items = [
-    { text: 'Bring the bloom to welding heat in the forge (1150 °C+)', done: !!(p && (p.stats.weldHeat || after('consolidate'))), st: 'forge' },
-    { text: `Consolidate it with gentle blows (${pct(p ? p.cohesion : 0)})`, done: after('consolidate'), st: 'anvil' },
-    { text: `Square it into a rough ingot${stg === 'ingot' ? ` (${pct(an.fitV)} to shape)` : ''}`, done: after('ingot'), st: 'anvil' },
-    { text: `Draw it out into a billet${stg === 'billet' ? ` (${pct(an.fitV)} to shape)` : ''}`, done: after('billet'), st: 'anvil' },
-  ];
-  const cur = items.find(o => !o.done);
+function objectives() {
+  const forging = !!g.piece || fs.placed;
+  const items = STEPS.filter(s => s.phase === (forging ? 'forge' : 'smelt')).map(s => ({ text: s.text(), done: s.done(), optional: s.optional, st: s.st }));
+  const cur = items.find(o => !o.done && !o.optional);
   if (cur) {
     cur.active = true;
     // when the work is too cold to forge, the next stop is the fire
-    if (p && cur.st === 'anvil' && p.T < (stg === 'consolidate' ? 1050 : 800)) cur.st = 'forge';
+    const p = g.piece;
+    if (p && cur.st === 'anvil' && p.T < (p.stage === 'consolidate' ? 1050 : 800)) cur.st = 'forge';
   }
-  g.hud.setObjectives(items, 'Forging');
+  g.hud.setObjectives(items, forging ? 'Forging' : 'Smelting');
   g.hud.setStation(active.id, cur ? cur.st : null);
-  g.hud.setInventory(p ? `<b>Workpiece</b> ${p.mass.toFixed(2)} kg · ${Math.round(p.T)} °C<br><b>Carbon</b> ~${p.carbon.toFixed(2)}%` : '');
-}
-function objectives() {
-  if (g.piece || stations.furnace.placed) return forgingObjectives();
-  const st = state, f = st.furnace, fs = stations.furnace, sim = fs.sim, built = f.courses >= NC;
-  const items = [
-    { text: `Pan iron sand at the stream (${st.orePanned.toFixed(1)} / 4 kg)`, done: st.orePanned >= 4 || sim.chargedOre >= 4, st: 'stream' },
-    { text: `Dig clay (${Math.min(st.clayDug, 8)} / 8)`, done: st.clayDug >= 8 || built, st: 'clay' },
-    { text: `Pull straw (${Math.min(st.strawPulled, 3)} / 3)`, done: st.strawPulled >= 3 || built, st: 'clay' },
-    { text: 'Mix clay, straw & water into daub', done: st.daubBatches > 0 || built, st: 'trough' },
-    { text: `Build the furnace walls (${f.courses} / ${NC} courses)`, done: built, st: 'furnace' },
-    { text: 'Fit the clay tuyere (air pipe)', done: f.tuyere, st: 'furnace' },
-    { text: 'Plug the front arch', done: f.plug, st: 'furnace' },
-    { text: 'Dry the furnace with a gentle fire', done: f.dried, st: 'furnace' },
-    { text: `Patch drying cracks${fs.openCracks ? ` (${fs.openCracks} left)` : ''}`, done: f.dried && fs.openCracks === 0, st: 'furnace', optional: true },
-    { text: 'Fill with charcoal & bring it to 1100 °C', done: sim.reachedHeat, st: 'furnace' },
-    { text: `Charge your iron sand & smelt (${sim.chargedOre.toFixed(1)} kg in)`, done: fs.breakReady || fs.broken, st: 'furnace' },
-    { text: 'Tap the slag as it rises', done: sim.slagTapped > 0.3, st: 'furnace', optional: true },
-    { text: 'Break open the front arch', done: fs.broken, st: 'furnace' },
-    { text: 'Pull the bloom onto the stump', done: fs.placed, st: 'furnace' },
-  ];
-  const cur = items.find(o => !o.done && !o.optional);
-  if (cur) cur.active = true;
-  g.hud.setObjectives(items);
-  g.hud.setStation(active.id, cur ? cur.st : null);
-  const pur = Math.round(purity() * 100);
-  g.hud.setInventory(
-    `<b>Clay basket</b> ${st.clay} &nbsp;·&nbsp; <b>Straw</b> ${st.straw}<br>` +
-    `<b>Daub</b> ${st.daub.toFixed(1)}${st.daubBatches ? ` (${Math.round(st.daubQ * 100)}% quality)` : ''}<br>` +
-    `<b>Iron sand</b> ${st.ore.toFixed(1)} kg${st.ore > 0 ? ` (${pur}% pure)` : ''}`);
+  if (forging) {
+    const p = g.piece;
+    g.hud.setInventory(p ? `<b>Workpiece</b> ${p.mass.toFixed(2)} kg · ${Math.round(p.T)} °C<br><b>Carbon</b> ~${p.carbon.toFixed(2)}%` : '');
+  } else {
+    const st = state, pur = Math.round(purity() * 100);
+    g.hud.setInventory(
+      `<b>Clay basket</b> ${st.clay} &nbsp;·&nbsp; <b>Straw</b> ${st.straw}<br>` +
+      `<b>Daub</b> ${st.daub.toFixed(1)}${st.daubBatches ? ` (${Math.round(st.daubQ * 100)}% quality)` : ''}<br>` +
+      `<b>Iron sand</b> ${st.ore.toFixed(1)} kg${st.ore > 0 ? ` (${pur}% pure)` : ''}`);
+  }
+  if (!devEl.hidden) refreshDev();
 }
 
-// ---------------------------------------------------------------- dev panel (` key)
-const dev = document.getElementById('dev');
-const devBtn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = () => { fn(); g.containers.refresh(); }; dev.appendChild(b); };
-devBtn('Give materials (clay, straw, 6 kg ore)', () => { Object.assign(state, { clay: 8, straw: 3, ore: 6, oreIronKg: 5.3, orePanned: 6, clayDug: 8, strawPulled: 3 }); });
-devBtn('Give daub (10 units)', () => { state.daubQ = state.daub ? state.daubQ : 0.85; state.daub += 10; state.daubBatches = Math.max(1, state.daubBatches); });
-devBtn('Build & dry furnace instantly', () => { stations.furnace.instantBuild(); });
-devBtn('Skip to forging: give a 2 kg bloom', () => {
-  const p = g.makePiece({ mass: 2, slag: 0.12, carbon: 0.5, T: 1250 });
-  p.stats.weldHeat = true; active.exit && active.exit(); active = null; goTo('anvil');
+// ---------------------------------------------------------------- Test tools panel (button or ` key)
+const devEl = document.getElementById('dev'), devToggle = document.getElementById('devToggle');
+devEl.innerHTML = `
+  <div class="devHead"><b>Test tools</b><button class="devClose" title="Close">×</button></div>
+  <button class="devSkip">Skip this step ›</button>
+  <div class="devSteps"></div>
+  <div class="devExtras"></div>`;
+const toggleDev = () => { devEl.hidden = !devEl.hidden; devToggle.classList.toggle('on', !devEl.hidden); if (!devEl.hidden) refreshDev(); };
+devToggle.onclick = toggleDev;
+devEl.querySelector('.devClose').onclick = toggleDev;
+devEl.querySelector('.devSkip').onclick = skipCurrent;
+const stepsEl = devEl.querySelector('.devSteps'), rows = [];
+STEPS.forEach((s, i) => {
+  if (i === 0 || STEPS[i - 1].phase !== s.phase) {
+    const h = document.createElement('div'); h.className = 'devPhase'; h.textContent = s.phase === 'smelt' ? 'Smelting' : 'Forging'; stepsEl.appendChild(h);
+  }
+  const r = document.createElement('div'); r.className = 'devRow';
+  r.innerHTML = `<span class="devMark"></span><span class="devText"></span><button title="Complete everything before this step and go there">Jump</button>`;
+  r.querySelector('button').onclick = () => jumpTo(i);
+  stepsEl.appendChild(r); rows.push(r);
 });
-devBtn('Set work to welding heat', () => { if (g.piece) g.piece.T = 1250; });
-devBtn('Skip consolidation (bloom set)', () => { const p = g.piece; if (p && p.stage === 'consolidate') { p.cohesion = 1; p.porosity = 0.05; p.densify(); p.stage = 'ingot'; p.T = 1250; stations.anvil.place(p); stations.anvil.panel(); } });
-devBtn('Time ×1 / ×4', () => { g.timeScale = g.timeScale === 1 ? 4 : 1; g.hud.toast('Time ×' + g.timeScale); });
+function refreshDev() {
+  const cur = firstOpen();
+  STEPS.forEach((s, i) => {
+    const r = rows[i], d = s.done();
+    r.classList.toggle('done', d); r.classList.toggle('cur', s === cur); r.classList.toggle('opt', !!s.optional);
+    const t = s.text().replace(/\s*\(.*\)$/, '');
+    const te = r.querySelector('.devText'); if (te.textContent !== t) te.textContent = t;
+    r.querySelector('.devMark').textContent = d ? '✓' : s === cur ? '▸' : '';
+  });
+  devEl.querySelector('.devSkip').disabled = !cur;
+}
+const extras = devEl.querySelector('.devExtras');
+const devBtn = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = () => { fn(); g.containers.refresh(); }; extras.appendChild(b); return b; };
+devBtn('Reheat the work to welding heat', () => { if (g.piece) { g.piece.T = 1250; g.hud.toast('1250 °C'); } else g.hud.toast('No workpiece yet'); });
+devBtn('Bring the furnace to 1250 °C', () => { fs.skipHeat(); fs.sim.T = 1250; });
+const tsBtn = devBtn('Time ×1', () => { g.timeScale = g.timeScale === 1 ? 4 : 1; tsBtn.textContent = 'Time ×' + g.timeScale; });
 
 // ---------------------------------------------------------------- main loop
 let hudT = 0;
@@ -259,5 +334,5 @@ g.hud.modal(`
   <p><b>Controls:</b> everything is the mouse. Hover over things and the hint at the bottom tells you
   what you can do. Move between stations with <kbd>A</kbd> / <kbd>D</kbd> (or click the tabs at the top).
   The objective list on the left marks the next step, and a dot on a tab shows where to go.</p>
-  <p style="color:var(--dim)">Tip: <kbd>\`</kbd> opens a dev panel with shortcuts.</p>`,
+  <p style="color:var(--dim)">Testing? The <b>Test tools</b> button (bottom left, or <kbd>\`</kbd>) skips the current step or jumps to any step.</p>`,
   [{ label: 'Begin', onClick: () => g.sfx.init() }]);

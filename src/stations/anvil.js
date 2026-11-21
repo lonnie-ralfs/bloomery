@@ -264,7 +264,7 @@ export class AnvilStation {
   _startBillet(b) {
     const p = this.piece; this.billet = b; p.stage = 'billet'; p.billet = b.id;
     this._refreshTarget(); this.panel();
-    const tg = this.tg;
+    const tg = this.tg = p.target(b.ratio); // also when the work isn't on the anvil right now
     this.g.hud.toast(`Draw it out to ${(tg.s * 100).toFixed(1)} cm square × ${(tg.L * 100).toFixed(0)} cm: hit along its length, roll a quarter turn, repeat.`, 'info', 6);
   }
   finishBillet() {
