@@ -129,6 +129,7 @@ window.addEventListener('keydown', e => {
   if (k === 'a' || k === 'arrowleft') cycle(-1);
   else if (k === 'd' || k === 'arrowright') cycle(1);
   else if ('123456'.includes(k)) goTo(order[+k - 1]);
+  else if (k === 'e' && !travelling) active.stand && active.stand();
   else if (e.key === '`') { const d = document.getElementById('dev'); d.hidden = !d.hidden; }
 });
 window.addEventListener('resize', () => engine.resize());

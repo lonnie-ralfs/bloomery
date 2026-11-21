@@ -18,13 +18,21 @@ Phase 1: **smelting**. Phase 2: **forging the bloom into a billet**. First perso
      rests on its ends and hit the hump to press it straight. Hitting one spot too often mushrooms it.
 - Dev panel (`): "Skip to forging" gives a 2 kg bloom on the anvil; "Skip consolidation" jumps to the ingot stage.
 
-### Deformation model (workpiece.js)
+- **Stand it on end (E)** in the ingot/billet stages to square the ends: a blow upsets the bar — it shortens near both
+  ends (more at the struck top), the end sections fill out toward the body's shape, and both end faces stay flat
+  (hammer on top, anvil underneath). Right-click flips it end for end; E lays it back down.
 
-The metal is a 40×8×8 lattice of material points; the visible mesh is embedded in it and follows by trilinear
-interpolation, so it stays smooth and can't crumple. Each blow: bend (if the bar is genuinely curved under the hammer) →
-sink the struck part onto the anvil → flat hammer face squashes each vertical column under it → flow along the bar
-(rigid shift beyond the hammer) and across it (struck slice widens), split by which free surface is nearer, solved
-so volume is conserved → small curl. A safety net rejects any blow that would fold the material.
+### Deformation model
+
+- **Bloom** (workpiece.js): a lattice of material points with the mesh embedded by a tricubic B-spline (smooth, no
+  kinks). Each blow squeezes the vertical lattice columns under the hammer between two planes — hammer face on top,
+  anvil underneath — then flows outward to conserve volume (with a mid-height barrel bulge).
+- **Ingot and billet** (bar.js): when the bloom sets it's converted to a stack of cross-sections along the bar (24-point
+  outlines). The mesh is a tube through them with flat end caps, so it can't fold or crumple, and volume is exact
+  (section area × spacing). A blow clips the struck sections flat on top (round hammer face) and underneath (anvil);
+  the lost area goes partly into length (spacing) and partly into width (barrel bulge), split by which free surface is
+  nearer. A lifted bar is pressed straight between its supports or swung down about where it rests (whole-bar bending,
+  so no waves); a badly curved one rocks. The hammer lands on the high spot across the width, as a smith's does.
 
 ## Run it
 

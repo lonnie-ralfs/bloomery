@@ -1,22 +1,26 @@
 // The hot workpiece: bloom -> rough ingot -> billet.
 //
-// The metal is a lattice of material points (40 x 8 x 8, interior included). The visible surface
-// mesh is embedded in that lattice and follows it by trilinear interpolation, so the surface stays
-// smooth and can't crumple however it's worked. Every blow moves the lattice points:
+// The metal is a lattice of material points (interior included). The visible surface mesh is
+// embedded in it by a tricubic B-spline, so the surface is smooth (no kinks) and can't crumple
+// however it's worked. Every blow moves the lattice points:
 //
-// Local frame: the anvil face is y = 0, the piece is centred on x/z and its long axis is x.
-//   1. bend, if the bar is genuinely curved under the hammer (press a bridge straight, or rock);
-//   2. sink: the struck part is pushed down onto the anvil (hot iron gives way);
-//   3. squash the column under the round hammer face against the anvil;
+// Local frame: the anvil face is y = 0, the piece is centred on x/z and its long axis is x
+// (or y when it's stood on end to square the ends).
+//   1. bend: a lifted bar is pressed straight between its supports, a slightly lifted end swings
+//      down, a badly curved bar rocks;
+//   2. squeeze the columns under the round hammer face between two planes: the hammer flattens
+//      the top, the anvil flattens the underside;
+//   3. (relax the material along the bar so it stays smooth and evenly spread);
 //   4. flow, solved so the volume is kept. Metal takes the shortest way to a free surface:
 //      along the bar (everything beyond the hammer shifts outward = the bar lengthens) and across
 //      it (the struck slice widens). The top of the struck slice moves further than the bottom,
 //      which mushrooms a spot that's hit too often;
 //   5. curl: the struck face stretches a little more than the face on the anvil, so the ends lift.
 import { B, V3, clamp, lerp, smooth, fbm3, interp, mat } from './util.js';
+import { BarModel } from './bar.js';
 
 const NX = 64, NY = 14, NZ = 14;       // surface mesh resolution
-const LX = 40, LY = 8, LZ = 8;         // material lattice resolution
+const LX = 42, LY = 10, LZ = 10;       // material lattice (incl. a one-node margin each side)
 export const DENSITY = 7870;
 export const HAMMER_R = 0.022;
 const PLAST = [[600, 0.03], [750, 0.15], [900, 0.45], [1050, 0.8], [1200, 1], [1350, 1.1]];
@@ -37,7 +41,7 @@ export class Workpiece {
     this.T = o.T ?? 1000;
     this.porosity = 0.35;             // the bloom is a sponge; consolidation closes it up
     this.cohesion = 0;
-    this.stage = 'consolidate';       // consolidate -> ingot -> billet -> done
+    this._stage = 'consolidate';      // consolidate -> ingot -> billet -> done
     this.location = 'none';
     this.stats = { blows: 0, crumbled: 0, coldHits: 0, burned: 0, slagOut: 0, consHeat: 0, consBlows: 0, startMass: this.mass };
     this.root = new B.TransformNode('pieceRoot', g.scene);
@@ -98,17 +102,25 @@ export class Workpiece {
       mnx = Math.min(mnx, pos[i]); mxx = Math.max(mxx, pos[i]); mny = Math.min(mny, pos[i + 1]); mxy = Math.max(mxy, pos[i + 1]); mnz = Math.min(mnz, pos[i + 2]); mxz = Math.max(mxz, pos[i + 2]);
     }
     const pad = 0.002; mnx -= pad; mxx += pad; mny -= pad; mxy += pad; mnz -= pad; mxz += pad;
+    // Cubic B-spline lattice: nodes 1..L-2 span the piece, nodes 0 and L-1 are a one-cell margin so
+    // every surface point has its full 4x4x4 neighbourhood (uniform B-splines reproduce the rest
+    // shape exactly and give a surface with no kinks along cell edges)
     const node = this.node = new Float32Array(LX * LY * LZ * 3);
+    const at = (lo, hi, i, L) => lo + (hi - lo) * (i - 1) / (L - 3);
     for (let i = 0; i < LX; i++) for (let j = 0; j < LY; j++) for (let kk = 0; kk < LZ; kk++) {
       const q = L3(i, j, kk);
-      node[q] = lerp(mnx, mxx, i / (LX - 1)); node[q + 1] = lerp(mny, mxy, j / (LY - 1)); node[q + 2] = lerp(mnz, mxz, kk / (LZ - 1));
+      node[q] = at(mnx, mxx, i, LX); node[q + 1] = at(mny, mxy, j, LY); node[q + 2] = at(mnz, mxz, kk, LZ);
     }
-    this.vb = new Int32Array(n); this.vf = new Float32Array(n * 3);
+    const bs = (t, out, o) => {
+      const t2 = t * t, t3 = t2 * t, u = 1 - t;
+      out[o] = u * u * u / 6; out[o + 1] = (3 * t3 - 6 * t2 + 4) / 6; out[o + 2] = (-3 * t3 + 3 * t2 + 3 * t + 1) / 6; out[o + 3] = t3 / 6;
+    };
+    this.vb = new Int32Array(n); this.vw = new Float32Array(n * 12);
     for (let v = 0; v < n; v++) {
-      const u = (pos[v * 3] - mnx) / (mxx - mnx) * (LX - 1), w = (pos[v * 3 + 1] - mny) / (mxy - mny) * (LY - 1), t = (pos[v * 3 + 2] - mnz) / (mxz - mnz) * (LZ - 1);
-      const i = Math.min(LX - 2, Math.floor(u)), j = Math.min(LY - 2, Math.floor(w)), kk = Math.min(LZ - 2, Math.floor(t));
-      this.vb[v] = (i * LY + j) * LZ + kk;
-      this.vf[v * 3] = u - i; this.vf[v * 3 + 1] = w - j; this.vf[v * 3 + 2] = t - kk;
+      const u = 1 + (pos[v * 3] - mnx) / (mxx - mnx) * (LX - 3), w = 1 + (pos[v * 3 + 1] - mny) / (mxy - mny) * (LY - 3), t = 1 + (pos[v * 3 + 2] - mnz) / (mxz - mnz) * (LZ - 3);
+      const i = clamp(Math.floor(u), 1, LX - 3), j = clamp(Math.floor(w), 1, LY - 3), kk = clamp(Math.floor(t), 1, LZ - 3);
+      this.vb[v] = ((i - 1) * LY + (j - 1)) * LZ + (kk - 1);
+      bs(u - i, this.vw, v * 12); bs(w - j, this.vw, v * 12 + 4); bs(t - kk, this.vw, v * 12 + 8);
     }
     this.eval(); this.settle();
 
@@ -124,18 +136,23 @@ export class Workpiece {
     m.material = this.mat; m.isPickable = false;
     this.g.world.caster(m);
   }
-  // surface from lattice (trilinear)
+  // surface from lattice (tricubic B-spline)
   eval() {
-    const N = this.node, p = this.pos, sY = LZ * 3, sX = LY * LZ * 3;
+    const N = this.node, p = this.pos, W = this.vw;
     for (let v = 0; v < this.n; v++) {
-      const b = this.vb[v] * 3, fx = this.vf[v * 3], fy = this.vf[v * 3 + 1], fz = this.vf[v * 3 + 2];
-      const gx = 1 - fx, gy = 1 - fy, gz = 1 - fz;
-      const w000 = gx * gy * gz, w001 = gx * gy * fz, w010 = gx * fy * gz, w011 = gx * fy * fz;
-      const w100 = fx * gy * gz, w101 = fx * gy * fz, w110 = fx * fy * gz, w111 = fx * fy * fz;
-      for (let c = 0; c < 3; c++) {
-        p[v * 3 + c] = w000 * N[b + c] + w001 * N[b + 3 + c] + w010 * N[b + sY + c] + w011 * N[b + sY + 3 + c]
-          + w100 * N[b + sX + c] + w101 * N[b + sX + 3 + c] + w110 * N[b + sX + sY + c] + w111 * N[b + sX + sY + 3 + c];
+      const base = this.vb[v], o = v * 12;
+      let x = 0, y = 0, z = 0;
+      for (let a = 0; a < 4; a++) {
+        const wa = W[o + a];
+        for (let b = 0; b < 4; b++) {
+          const wab = wa * W[o + 4 + b], row = base + (a * LY + b) * LZ;
+          for (let c = 0; c < 4; c++) {
+            const w = wab * W[o + 8 + c], q = (row + c) * 3;
+            x += w * N[q]; y += w * N[q + 1]; z += w * N[q + 2];
+          }
+        }
       }
+      p[v * 3] = x; p[v * 3 + 1] = y; p[v * 3 + 2] = z;
     }
   }
   _tongs() {
@@ -160,6 +177,31 @@ export class Workpiece {
     this.tongs.position.set(b.minX + 0.015, b.minY + h * 0.5, cnt ? zc / cnt : 0);
     for (const j of this.tongJaws) j.position.y = j.metadata.side * h * 0.5;
   }
+  // ------------------------------------------------------------------ bar mode (ingot + billet)
+  // Once the bloom has set it is converted to a section-based bar (bar.js): a stack of cross-
+  // sections that can't fold, conserves volume exactly, and squares and draws out cleanly.
+  get stage() { return this._stage; }
+  set stage(s) { this._stage = s; if (s !== 'consolidate' && !this.bar && this.mesh) this.toBar(); }
+  toBar() {
+    this.bar = BarModel.fromSurface(this.pos);
+    this.bar.setVolume(this.targetVol);
+    this._syncBar(true);
+  }
+  _syncBar(rebuild = false) {
+    const g = this.bar.mesh();
+    const grew = g.nv !== this.n;
+    this.pos = g.pos; this.idx = g.rh; this.ridx = g.bab; this.n = g.nv;
+    if (grew || rebuild) {
+      this.col = new Float32Array(this.n * 4).fill(1);
+      this.mesh.setVerticesData(B.VertexBuffer.PositionKind, this.pos, true);
+      this.mesh.setVerticesData(B.VertexBuffer.ColorKind, this.col, true);
+      const nrm = new Float32Array(this.n * 3); B.VertexData.ComputeNormals(this.pos, this.ridx, nrm);
+      this.mesh.setVerticesData(B.VertexBuffer.NormalKind, nrm, true);
+      this.mesh.setIndices(this.ridx);
+      this.mesh.refreshBoundingInfo(); this._placeTongs();
+    } else this.updateMesh();
+  }
+  get upright() { return this.bar ? this.bar.upright : false; }
   updateMesh() {
     const m = this.mesh;
     m.updateVerticesData(B.VertexBuffer.PositionKind, this.pos);
@@ -173,6 +215,7 @@ export class Workpiece {
 
   // ------------------------------------------------------------------ geometry queries (surface)
   volume() {
+    if (this.bar) return this.bar.volume();
     const pos = this.pos, I = this.idx; let v = 0;
     for (let t = 0; t < I.length; t += 3) {
       const a = I[t] * 3, b = I[t + 1] * 3, c = I[t + 2] * 3;
@@ -195,7 +238,10 @@ export class Workpiece {
     for (const a of [this.node, this.pos]) for (let i = 0; i < a.length; i += 3) { a[i] += dx; a[i + 1] += dy; a[i + 2] += dz; }
   }
   // rest on the anvil (lowest point at y = 0), centred on x and z
-  settle() { const b = this.bounds(); this._move(-(b.minX + b.maxX) / 2, -b.minY, -(b.minZ + b.maxZ) / 2); }
+  settle() {
+    if (this.bar) { this.bar.settle(); return this._syncBar(); }
+    const b = this.bounds(); this._move(-(b.minX + b.maxX) / 2, -b.minY, -(b.minZ + b.maxZ) / 2);
+  }
   topAt(x, z = 0, R = HAMMER_R) {
     const p = this.pos; let top = -1;
     for (let i = 0; i < p.length; i += 3) {
@@ -203,6 +249,18 @@ export class Workpiece {
       if (dx * dx + dz * dz < R * R && p[i + 1] > top) top = p[i + 1];
     }
     return top;
+  }
+  // Where across the width the hammer lands: on the high spot, as a smith does (on a piece wider
+  // than the face, always hitting the centre line would just cut a groove). Kept on the work.
+  strikeZ(x0, sl = this.sliceAt(x0)) {
+    if (!sl) return 0;
+    const p = this.pos, R = HAMMER_R;
+    if (sl.halfW <= R * 0.6) return sl.zc;
+    let best = -1, zs = 0, n = 0;
+    for (let i = 0; i < p.length; i += 3) if (Math.abs(p[i] - x0) < R * 0.5 && p[i + 1] > best) best = p[i + 1];
+    for (let i = 0; i < p.length; i += 3) if (Math.abs(p[i] - x0) < R * 0.5 && p[i + 1] > best - 0.002) { zs += p[i + 2]; n++; }
+    const lim = sl.halfW - R * 0.6;
+    return clamp(n ? zs / n : sl.zc, sl.zc - lim, sl.zc + lim);
   }
   sliceAt(x0, R = HAMMER_R) {
     const p = this.pos; let lo = 1e9, hi = -1e9;
@@ -223,6 +281,17 @@ export class Workpiece {
   // ------------------------------------------------------------------ deformation (on the lattice)
   // returns { kind: 'compress' | 'press' | 'rock' | 'miss', delta }
   blow(x0, v, o = {}) {
+    if (this.bar) {
+      const plast = plasticity(this.T) * (o.soft ?? 1);
+      if (this.bar.upright) { const r = this.bar.upset(v, plast); this._syncBar(); return r; }
+      const zc = this.strikeZ(x0);
+      const r = this.bar.draw(x0, zc, v, plast, { bending: o.bending, curl: o.curl, smooth: o.smooth });
+      // tiny drift from resampling: keep the volume exact
+      const V = this.bar.volume(), tv = this.targetVol;
+      if (Math.abs(V / tv - 1) > 0.003) this.bar.setVolume(tv);
+      this._syncBar();
+      return r;
+    }
     const N0 = this.node.slice(), V0 = this.volume();
     const r = this._blow(x0, v, o);
     // safety net: never accept a blow that folds the material
@@ -237,7 +306,7 @@ export class Workpiece {
     const R = HAMMER_R, N = this.node;
     const sl = this.sliceAt(x0);
     if (!sl) return { kind: 'miss' };
-    const zc = sl.zc;                       // the smith keeps the work under the hammer
+    const zc = this.strikeZ(x0, sl);        // the hammer finds the high spot across the width
     let top = this.topAt(x0, zc, R);
     if (top < 0) return { kind: 'miss' };
     const plast = plasticity(this.T) * (o.soft ?? 1);
@@ -250,8 +319,10 @@ export class Workpiece {
     if (gap > 1e8) gap = 0;
 
     const localThick = Math.max(0.004, top - gap);
-    if (barLike && gap > Math.max(0.004, 0.3 * localThick)) {
-      // genuinely curved under the hammer: bend rather than squash
+    const rockThr = Math.max(0.004, 0.3 * localThick);
+    // ---- a lifted bar bends as a whole around where it rests, before (or instead of) squashing.
+    // Whole-bar bending keeps it smooth; pushing just the struck spot down is what made it wavy.
+    if (barLike && gap > 0.0008) {
       let xl = null, xr = null;
       for (let k = 0; k < pr.nb; k++) {
         if (pr.bot[k] > 0.0015) continue;
@@ -264,60 +335,30 @@ export class Workpiece {
           const x = N[i], hat = x <= xl || x >= xr ? 0 : x < x0 ? (x - xl) / (x0 - xl) : (xr - x) / (xr - x0);
           N[i + 1] -= amt * hat;
         }
-        this.eval(); this.settle(); this.updateMesh();
-        return { kind: 'press', amount: amt };
+        this.eval();
+        if (gap > rockThr) { this.settle(); this.updateMesh(); return { kind: 'press', amount: amt }; }
+      } else if (gap > rockThr) {
+        return { kind: 'rock', side: xl === null ? -1 : 1 };
+      } else { // slightly lifted overhanging end: it swings down about where it rests
+        const xc = xl ?? xr, span = x0 - xc;
+        if (Math.abs(span) > 1e-3) {
+          for (let i = 0; i < N.length; i += 3) { const f = (N[i] - xc) / span; if (f > 0) N[i + 1] -= gap * f; }
+          this.eval();
+        }
       }
-      return { kind: 'rock', side: xl === null ? -1 : 1 };
-    }
-
-    // ---- sink the struck part down onto the anvil
-    if (gap > 0.0002) {
-      const sink = Math.min(gap, 0.004 + 0.0015 * v * v * plast);
-      for (let i = 0; i < N.length; i += 3) {
-        const w = 1 - smooth(R * 0.6, R * 2.4, Math.abs(N[i] - x0));
-        if (w > 0) N[i + 1] -= sink * w;
-      }
-      for (let i = 1; i < N.length; i += 3) if (N[i] < 0) N[i] = 0;
-      this.eval();
-      top = this.topAt(x0, zc, R);
+      top = Math.max(this.topAt(x0, zc, R), 0.002);
     }
     top = Math.max(top, 0.002);
-    // ---- the flat hammer face comes down to height hp: every lattice column under the face whose
-    // top is above hp is squashed (top to hp, bottom held by the anvil), so domes become flat facets
-    const dh = 0.00045 * v * v * plast;
+    // ---- squeezed between two flat faces: the hammer comes down to height hp and the anvil holds
+    // the underside at y = 0. Each vertical column under the face is mapped so its top goes to the
+    // hammer plane and its underside onto the anvil plane — both faces flatten.
+    const dh = 0.0006 * v * v * plast;
     const delta = clamp(dh / top, 0, 0.35);
-    // vertical columns in world space (the lattice may be rolled any way up): a top/bottom
-    // heightmap of the surface under the hammer, then every lattice point in a column is scaled
-    const CELL = 0.004, RB = R * 1.4, nb = Math.ceil(2 * RB / CELL), P = this.pos;
-    const ct = new Float32Array(nb * nb).fill(-1e9), cb = new Float32Array(nb * nb).fill(1e9);
-    const binXZ = (x, z) => {
-      const bx = Math.floor((x - x0 + RB) / CELL), bz = Math.floor((z - zc + RB) / CELL);
-      return bx < 0 || bz < 0 || bx >= nb || bz >= nb ? -1 : bx * nb + bz;
-    };
-    for (let i = 0; i < P.length; i += 3) {
-      const b = binXZ(P[i], P[i + 2]); if (b < 0) continue;
-      if (P[i + 1] > ct[b]) ct[b] = P[i + 1]; if (P[i + 1] < cb[b]) cb[b] = P[i + 1];
-    }
-    // fill empty cells from neighbours (sparse surface sampling)
-    for (let pass = 0; pass < 2; pass++) for (let bx = 0; bx < nb; bx++) for (let bz = 0; bz < nb; bz++) {
-      const b = bx * nb + bz; if (ct[b] > -1e8) continue;
-      let t = -1e9, lo = 1e9;
-      for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const X = bx + ox, Z = bz + oz; if (X < 0 || Z < 0 || X >= nb || Z >= nb) continue;
-        const q = X * nb + Z; if (ct[q] > t) t = ct[q]; if (cb[q] < lo) lo = cb[q];
-      }
-      if (pass === 1 || t > -1e8) { ct[b] = t; cb[b] = lo; }
-    }
     const hp = top * (1 - delta);
-    for (let i = 0; i < N.length; i += 3) {
-      const b = binXZ(N[i], N[i + 2]); if (b < 0) continue;
-      const w = 1 - smooth(R * 0.85, R * 1.25, Math.hypot(N[i] - x0, N[i + 2] - zc));
-      const yt = ct[b], yb = Math.max(0, cb[b]);
-      if (w <= 0 || yt < -1e8 || yt <= hp || yb >= hp - 1e-4 || yt - yb < 1e-4) continue;
-      const nt = lerp(yt, hp, w), s = clamp((nt - yb) / (yt - yb), 0.5, 1);
-      N[i + 1] = yb + (N[i + 1] - yb) * s;
-    }
-    this.eval();
+    // how far a blow drives a lifted underside onto the anvil: a soft lump gives way locally; a bar
+    // bends as a whole (handled above), so here it only flattens small bumps — local dips make waves
+    const drive = barLike ? 0.0015 : Math.min(0.004 + 0.002 * v * v * plast, 0.03);
+    this._squeezeColumns(x0, zc, delta, drive);
     // ---- flow outward, keeping the volume
     const Vc = this.volume(), dV = this.targetVol - Vc;
     if (dV > 0) {
@@ -326,16 +367,21 @@ export class Workpiece {
       const area = colH * 2 * halfW * 0.85;
       const ux = fx / (2 * area), uz = (1 - fx) / (2 * colH * 2.6 * R);
       const N0 = N.slice();
-      this._flow(x0, zc, ux * dV, uz * dV, top, halfW); this.eval();
+      // sideways spread is symmetric about the bar's own centre line (spreading from an off-centre
+      // strike point would bend the bar sideways)
+      this._flow(x0, sl.zc, ux * dV, uz * dV, top, halfW); this.eval();
       const got = this.volume() - Vc;
-      if (got > 1e-12) { N.set(N0); const k = clamp(dV / got, 0.3, 3); this._flow(x0, zc, ux * dV * k, uz * dV * k, top, halfW); this.eval(); }
+      if (got > 1e-12) { N.set(N0); const k = clamp(dV / got, 0.3, 3); this._flow(x0, sl.zc, ux * dV * k, uz * dV * k, top, halfW); this.eval(); }
     }
     // ---- curl
     if (barLike && o.curl !== 0) {
       const kap = (o.curl ?? 0.008) * delta;
       for (let i = 0; i < N.length; i += 3) N[i + 1] += kap * Math.max(0, Math.abs(N[i] - x0) - R);
     }
-    if (o.smooth) this._smoothNear(x0, zc, R * 1.8, o.smooth);
+    if (o.smooth) {
+      if (this.stage === 'consolidate') this._smoothNear(x0, zc, R * 1.8, o.smooth);
+      else this._relax(x0, zc, R * 2.6, o.smooth);
+    }
     // consolidation closes the sponge: the bloom shrinks toward its solid volume
     this.eval();
     const V = this.volume(), tv = this.targetVol;
@@ -344,13 +390,129 @@ export class Workpiece {
     this.updateMesh();
     return { kind: 'compress', delta };
   }
+  // Which lattice axis currently points up (rolls and stand-ups are quarter turns, so one does),
+  // and whether index 0 is at the bottom.
+  _upAxis() {
+    const N = this.node, d = [0, 0, 0];
+    const mi = LX >> 1, mj = LY >> 1, mk = LZ >> 1;
+    d[0] = N[L3(mi + 1, mj, mk) + 1] - N[L3(mi, mj, mk) + 1];
+    d[1] = N[L3(mi, mj + 1, mk) + 1] - N[L3(mi, mj, mk) + 1];
+    d[2] = N[L3(mi, mj, mk + 1) + 1] - N[L3(mi, mj, mk) + 1];
+    let ax = 0; for (let a = 1; a < 3; a++) if (Math.abs(d[a]) > Math.abs(d[ax])) ax = a;
+    return { ax, up: d[ax] > 0 };
+  }
+  // Squeeze between two flat faces. The lattice lines that run vertically are the columns. Each
+  // column under the hammer gets one straight-line remap: its top comes down to the hammer face,
+  // and the column is pushed down as a unit until its underside meets the anvil (then it
+  // compresses). Neighbouring columns get smoothly varying remaps, so the smooth surface can't
+  // fold, both faces end up flat, and a piece stood on end is upset with both ends flattened.
+  _squeezeColumns(x0, zc, delta, drive) {
+    const N = this.node, R = HAMMER_R, { ax, up } = this._upAxis();
+    const S = [LX, LY, LZ], o1 = ax === 0 ? 1 : 0, o2 = ax === 2 ? 1 : 2, n = S[ax];
+    const idx = (a, b, c) => { const t = [0, 0, 0]; t[ax] = a; t[o1] = b; t[o2] = c; return L3(t[0], t[1], t[2]); };
+    // the planes in lattice terms: lattice tops/bottoms stand a fixed margin off the surface
+    let topMax = -1e9, floor = 1e9;
+    const lines = [];
+    for (let b = 0; b < S[o1]; b++) for (let c = 0; c < S[o2]; c++) {
+      let yt = -1e9, yb = 1e9, sx = 0, sz = 0;
+      for (let a = 0; a < n; a++) { const q = idx(a, b, c); yt = Math.max(yt, N[q + 1]); yb = Math.min(yb, N[q + 1]); sx += N[q]; sz += N[q + 2]; }
+      const w = 1 - smooth(R * 0.85, R * 1.3, Math.hypot(sx / n - x0, sz / n - zc));
+      lines.push({ b, c, yt, yb, w });
+      floor = Math.min(floor, yb);
+      if (w > 0.99) topMax = Math.max(topMax, yt);
+    }
+    if (topMax < -1e8) return;
+    const hp = floor + (topMax - floor) * (1 - delta);
+    for (const L of lines) {
+      if (L.w <= 0 || L.yt - L.yb < 1e-5) continue;
+      const nt = L.yt > hp ? lerp(L.yt, hp, L.w) : L.yt;
+      const push = L.yt - nt;
+      const nb = Math.max(floor, L.yb - Math.min(push + 0.0005 * L.w, drive) * L.w);
+      if (nt <= nb + 1e-4) continue;
+      const s = (nt - nb) / (L.yt - L.yb);
+      for (let a = 0; a < n; a++) { const q = idx(a, L.b, L.c); N[q + 1] = nb + (N[q + 1] - L.yb) * s; }
+    }
+    this.eval();
+  }
+  // Project the surface under the hammer onto the two planes (hammer face at hp, anvil at 0).
+  // Lattice points move vertically by the remaining error, blended through the column's height
+  // (top error near the top, bottom error near the bottom). A few iterations converge because the
+  // B-spline surface is a smooth average of the points around it.
+  _squeeze(x0, zc, hp, drive) {
+    const N = this.node, P = this.pos, R = HAMMER_R;
+    const CELL = 0.007, RB = R * 1.6, nb = Math.ceil(2 * RB / CELL);
+    const ct = new Float32Array(nb * nb), cb = new Float32Array(nb * nb);
+    const et = new Float32Array(nb * nb), eb = new Float32Array(nb * nb), tt = new Float32Array(nb * nb), bt = new Float32Array(nb * nb), has = new Uint8Array(nb * nb), hasF = new Float32Array(nb * nb);
+    const sample = (A, x, z) => { // bilinear lookup
+      const fx = (x - x0 + RB) / CELL - 0.5, fz = (z - zc + RB) / CELL - 0.5;
+      const ix = clamp(Math.floor(fx), 0, nb - 2), iz = clamp(Math.floor(fz), 0, nb - 2), tx = clamp(fx - ix, 0, 1), tz = clamp(fz - iz, 0, 1);
+      return lerp(lerp(A[ix * nb + iz], A[(ix + 1) * nb + iz], tx), lerp(A[ix * nb + iz + 1], A[(ix + 1) * nb + iz + 1], tx), tz);
+    };
+    for (let it = 0; it < 4; it++) {
+      ct.fill(-1e9); cb.fill(1e9);
+      for (let i = 0; i < P.length; i += 3) {
+        const bx = Math.floor((P[i] - x0 + RB) / CELL), bz = Math.floor((P[i + 2] - zc + RB) / CELL);
+        if (bx < 0 || bz < 0 || bx >= nb || bz >= nb) continue;
+        const b = bx * nb + bz; if (P[i + 1] > ct[b]) ct[b] = P[i + 1]; if (P[i + 1] < cb[b]) cb[b] = P[i + 1];
+      }
+      // a cell that only caught one face (sparse sampling) isn't a column: drop it and fill from neighbours
+      let thick = 0;
+      for (let b = 0; b < nb * nb; b++) if (ct[b] > -1e8) thick = Math.max(thick, ct[b] - cb[b]);
+      for (let b = 0; b < nb * nb; b++) if (ct[b] > -1e8 && ct[b] - cb[b] < thick * 0.3) { ct[b] = -1e9; cb[b] = 1e9; }
+      // errors: how far each part of the top sits above the hammer face and the underside above the anvil
+      for (let b = 0; b < nb * nb; b++) {
+        if (it === 0) has[b] = ct[b] > -1e8 ? 1 : 0;
+        if (ct[b] < -1e8 || !has[b]) { et[b] = NaN; eb[b] = NaN; continue; }
+        // Targets are fixed on the first pass. The hammer brings the top down to its face; the
+        // column is pushed down as a unit, so its underside drops by the same amount until it meets
+        // the anvil (never below). Later passes just correct toward those targets.
+        if (it === 0) {
+          const push = Math.max(0, ct[b] - hp);
+          tt[b] = ct[b] - push;
+          bt[b] = Math.max(0, cb[b] - Math.min(push + 0.0005, drive));
+        }
+        et[b] = clamp(ct[b] - tt[b], -0.003, 0.05); eb[b] = clamp(cb[b] - bt[b], -0.003, 0.05);
+      }
+      // fill gaps and blur once so neighbouring lattice points get similar corrections
+      for (const A of [et, eb, ct, cb]) {
+        const T = A.slice();
+        for (let bx = 0; bx < nb; bx++) for (let bz = 0; bz < nb; bz++) {
+          let s = 0, c = 0;
+          for (let ox = -1; ox <= 1; ox++) for (let oz = -1; oz <= 1; oz++) {
+            const X = bx + ox, Z = bz + oz; if (X < 0 || Z < 0 || X >= nb || Z >= nb) continue;
+            const q = T[X * nb + Z]; if (Number.isNaN(q) || q < -1e8 || q > 1e8) continue; s += q; c++;
+          }
+          if (c) A[bx * nb + bz] = (Number.isNaN(T[bx * nb + bz]) || T[bx * nb + bz] < -1e8 || T[bx * nb + bz] > 1e8 || it === 0) ? s / c : (T[bx * nb + bz] * 2 + s / c) / 3;
+          else A[bx * nb + bz] = 0;
+        }
+      }
+      if (it === 0) for (let b = 0; b < nb * nb; b++) hasF[b] = has[b];
+      let moved = 0;
+      for (let i = 0; i < N.length; i += 3) {
+        const r = Math.hypot(N[i] - x0, N[i + 2] - zc); if (r > RB) continue;
+        // only where there really is a column of metal (not past the end or beside the bar)
+        const w = (1 - smooth(R * 0.85, R * 1.25, r)) * smooth(0.5, 0.95, sample(hasF, N[i], N[i + 2])); if (w <= 0) continue;
+        const yt = sample(ct, N[i], N[i + 2]), yb = sample(cb, N[i], N[i + 2]);
+        const h = yt - yb; if (!(h > 1e-4)) continue;
+        const t = clamp((N[i + 1] - yb) / h, 0, 1);               // 0 = underside, 1 = top
+        const dy = -(sample(et, N[i], N[i + 2]) * t + sample(eb, N[i], N[i + 2]) * (1 - t)) * w;
+        N[i + 1] += dy; moved = Math.max(moved, Math.abs(dy));
+      }
+      this.eval();
+      if (moved < 1e-4) break;
+    }
+  }
   _flow(x0, zc, Dx, Dz, top, halfW) {
     const N = this.node, R = HAMMER_R;
     for (let i = 0; i < N.length; i += 3) {
       const dx = N[i] - x0, ax = Math.abs(dx);
       const wx = 1 - smooth(R, R * 1.9, ax);
-      const hb = lerp(1, 0.86 + 0.28 * clamp(N[i + 1] / Math.max(top, 1e-4), 0, 1.3), wx);
-      N[i] += Math.sign(dx) * Dx * Math.min(1, ax / R) * hb;
+      // barrelling: gripped by the hammer above and the anvil below, the struck slice bulges most
+      // at mid-height. Repeated blows on one spot make that spot flare out (mushroom).
+      const hy = clamp(N[i + 1] / Math.max(top, 1e-4), 0, 1);
+      const hb = lerp(1, 0.78 + 0.44 * Math.sin(Math.PI * hy), wx);
+      // lengthwise flow is the same at every height (varying it shears the bar into wrinkles)
+      N[i] += Math.sign(dx) * Dx * Math.min(1, ax / R);
       N[i + 2] += clamp((N[i + 2] - zc) / halfW, -1.3, 1.3) * Dz * wx * hb;
     }
   }
@@ -382,6 +544,26 @@ export class Workpiece {
       this.col[ci] = lerp(this.col[ci], 1, w); this.col[ci + 1] = lerp(this.col[ci + 1], 0.95, w); this.col[ci + 2] = lerp(this.col[ci + 2], 0.92, w);
     }
   }
+  // Relax the material along the bar's length near the blow: evens out node spacing and irons out
+  // small waves, without touching the cross-section (so square corners stay square).
+  _relax(x0, zc, RR, amt) {
+    const N = this.node, T = N.slice();
+    for (let i = 1; i < LX - 1; i++) for (let j = 0; j < LY; j++) for (let k = 0; k < LZ; k++) {
+      const q = L3(i, j, k), r = Math.hypot(N[q] - x0, N[q + 2] - zc);
+      if (r > RR) continue;
+      // leave the freshly flattened face alone; smooth the ring around it where waves form
+      const w = amt * (1 - r / RR) * smooth(HAMMER_R * 0.8, HAMMER_R * 1.3, r), a = L3(i - 1, j, k), b = L3(i + 1, j, k);
+      for (let c = 0; c < 3; c++) N[q + c] = lerp(N[q + c], (T[a + c] + T[b + c]) / 2, w);
+    }
+  }
+  // stand the work on end (or lay it back down) — bar stages only
+  tip() {
+    if (!this.bar) return;
+    this.bar.upright = !this.bar.upright;
+    this._syncBar(true);
+  }
+  // end for end while stood up
+  flipEnds() { if (this.bar) { this.bar.flipEnds(); this._syncBar(); } }
   // a hard blow on a fragile bloom knocks a chunk off
   crumble(x0, lossKg) {
     const N = this.node, top = this.topAt(x0, 0, HAMMER_R * 1.5);
@@ -401,12 +583,14 @@ export class Workpiece {
   }
   // shrink straight to the target volume (used when skipping consolidation)
   densify() {
+    if (this.bar) { this.bar.setVolume(this.targetVol); return this._syncBar(); }
     const k = Math.cbrt(this.targetVol / this.volume());
     for (let i = 0; i < this.node.length; i++) this.node[i] *= k;
     this.eval(); this.settle(); this.updateMesh();
   }
   // quarter turn about the long axis
   roll(dir = 1) {
+    if (this.bar) { this.bar.roll(dir); return this._syncBar(); }
     const b = this.bounds(), yc = (b.minY + b.maxY) / 2;
     for (const a of [this.node, this.pos]) for (let i = 0; i < a.length; i += 3) {
       const y = a[i + 1] - yc, z = a[i + 2];

@@ -87,13 +87,34 @@ export class AnvilStation {
     p.mesh.rotation.set(0, 0, 0);
     this._refreshTarget();
   }
-  exit() { this.target.setEnabled(false); }
+  exit() {
+    this.target.setEnabled(false);
+    const p = this.piece; if (p && p.upright) p.tip(-1); // carried lying down
+  }
   accepts() { return false; }
   down() {}
   up() {}
+  // stand the work on end to square (upset) the ends, or lay it back down
+  stand() {
+    const p = this.piece;
+    if (!p || p.location !== 'anvil' || p.stage === 'done') return;
+    if (p.stage === 'consolidate') return this.g.hud.toast('Consolidate the bloom first — it would crumble on end');
+    const up = !p.upright, m = p.mesh;
+    p.tip(up ? 1 : -1);
+    const b = p.bounds(); m.setPivotPoint(V3(0, (b.minY + b.maxY) / 2, 0));
+    this.g.tweens.add(0.2, k => { m.rotation.z = (1 - ease.out(k)) * (up ? -1 : 1) * Math.PI / 2; }, () => { m.rotation.z = 0; });
+    this.g.sfx.play('thunk', 0.5);
+    if (up) this.g.hud.toast('Standing on end: hit the top to square the ends. Both ends flatten — the top on the hammer, the bottom on the anvil. Right-click flips it end for end; E lays it down.', 'info', 5);
+    this._refreshTarget(); this.panel();
+  }
   roll(dir) {
     const p = this.piece;
     if (!p || p.location !== 'anvil' || p.stage === 'done') return;
+    if (p.upright) { // flip end for end
+      p.flipEnds();
+      this.g.sfx.play('thunk', 0.4); this._refreshTarget();
+      return;
+    }
     p.roll(dir);
     const m = p.mesh, b = p.bounds();
     m.setPivotPoint(V3(0, (b.minY + b.maxY) / 2, 0));
@@ -118,8 +139,8 @@ export class AnvilStation {
       this.hp.x += this.hv.x * h; this.hp.y += this.hv.y * h;
       // what's under the face?
       const sl = onAnvil ? p.sliceAt(this.hp.x) : null;
-      this.hz = sl ? sl.zc : 0;
-      let surf = sl ? p.topAt(this.hp.x, sl.zc) : -1, onMetal = surf >= 0;
+      if (sl && i === 0) this.hz = p.strikeZ(this.hp.x, sl); else if (!sl) this.hz = 0;
+      let surf = sl ? p.topAt(this.hp.x, this.hz) : -1, onMetal = surf >= 0;
       if (!onMetal) surf = Math.abs(this.hp.x) < FACE ? 0 : this.hp.x > FACE && this.hp.x < FACE + 0.18 ? -0.02 - (this.hp.x - FACE) * 0.1 : -0.3;
       if (this.hp.y < surf) {
         if (this.armed && this.hv.y < -0.5) this._impact(-this.hv.y, this.hp.x, onMetal);
@@ -187,7 +208,7 @@ export class AnvilStation {
         p.stats.coldHits++;
         g.hud.toast('Too cold! Hammering cold iron cracks it — back to the forge', 'bad', 2);
       }
-      const r = p.blow(x, v, { bending: true, smooth: 0.12 });
+      const r = p.blow(x, v, { bending: !p.upright, smooth: 0.22 });
       this.lastKind = r.kind;
       if (r.kind === 'rock') {
         const m = p.mesh, side = r.side;
@@ -212,7 +233,7 @@ export class AnvilStation {
   _ratio() { const p = this.piece; return p.stage === 'ingot' ? 0 : this.billet ? this.billet.ratio : 0; }
   _refreshTarget() {
     const p = this.piece;
-    const show = p && p.location === 'anvil' && (p.stage === 'ingot' || p.stage === 'billet');
+    const show = p && p.location === 'anvil' && !p.upright && (p.stage === 'ingot' || p.stage === 'billet');
     this.target.setEnabled(!!show);
     if (!show) return;
     const tg = this.tg = p.target(this._ratio());
@@ -287,7 +308,8 @@ export class AnvilStation {
     const p = this.piece;
     if (!p) return 'No workpiece yet — finish the smelt and set the bloom on the stump (or use the dev panel: `)';
     if (p.location !== 'anvil') return '';
-    return 'Lift the mouse, then bring it down to strike — faster is harder. Right-click / scroll: quarter turn.';
+    if (p.upright) return 'On end: strike the top to square the ends. Right-click: flip end for end. E: lay it down.';
+    return 'Lift the mouse, then bring it down to strike — faster is harder. Right-click / scroll: quarter turn. E: stand on end.';
   }
   _advice() {
     const p = this.piece;
@@ -314,6 +336,7 @@ export class AnvilStation {
     if (stage === 'consolidate') defs.push({ id: 'coh', label: 'Consolidation', min: 0, max: 1, color: '#6fbf73' });
     if (stage === 'ingot' || stage === 'billet' || stage === 'done') defs.push({ id: 'fit', label: 'Match to outline', min: 0, max: 1, color: '#7fb8e0', bands: [{ from: 0.85, to: 1, cls: 'good' }] });
     defs.push({ id: 'info', type: 'text' });
+    if (stage === 'ingot' || stage === 'billet') defs.push({ id: 'stand', type: 'button', label: p && p.upright ? 'Lay it down (E)' : 'Stand it on end to square the ends (E)', onClick: () => this.stand() });
     if (stage === 'ingot') defs.push({ id: 'fin', type: 'button', label: 'This is my rough ingot', onClick: () => this.finishIngot() });
     if (stage === 'billet') defs.push({ id: 'fin', type: 'button', label: 'Finish the billet', onClick: () => this.finishBillet() });
     const title = { consolidate: 'Anvil — consolidate the bloom', ingot: 'Anvil — rough ingot', billet: 'Anvil — ' + (this.billet ? this.billet.label.toLowerCase() : 'billet'), done: 'Anvil — done', none: 'Anvil' }[stage];
